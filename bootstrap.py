@@ -62,7 +62,12 @@ def run_streamlit(python_bin: Path, port: int, headless: bool = True) -> int:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Bootstrap do FII Quote Tracker")
-    p.add_argument("--port", type=int, default=0, help="Porta para o servidor (0 = escolher automaticamente)")
+    p.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Porta preferida/inicial (se ocupada, usa a próxima livre; 0 = escolher automaticamente a partir de 8501)",
+    )
     p.add_argument("--no-install", action="store_true", help="Não instalar/atualizar dependências")
     p.add_argument("--headless", action="store_true", help="Rodar em modo headless")
     return p.parse_args()
@@ -74,7 +79,10 @@ def main() -> None:
         sys.exit(1)
 
     args = parse_args()
-    port = args.port or find_free_port()
+    # Escolhe porta livre: se --port fornecida, tenta a partir dela; caso contrário, inicia em 8501
+    start_port = args.port if args.port and args.port > 0 else 8501
+    # Primeiro, escolhe uma porta livre como tentativa inicial
+    port = find_free_port(start=start_port, end=8600)
     python_bin = ensure_venv()
 
     if not args.no_install:
@@ -84,8 +92,18 @@ def main() -> None:
             sys.exit(1)
         pip_install(python_bin, req)
 
-    code = run_streamlit(python_bin, port=port, headless=args.headless)
-    sys.exit(code)
+    # Tenta iniciar o Streamlit; se falhar (ex.: porta ocupada na hora do bind), tenta portas subsequentes
+    for candidate_port in range(port, 8601):
+        code = run_streamlit(python_bin, port=candidate_port, headless=args.headless)
+        if code == 0:
+            # Processo terminou normalmente (fim do app)
+            sys.exit(0)
+        else:
+            # Falhou rapidamente (p.ex., porta em uso). Tenta próxima porta.
+            print(f"[bootstrap] Falha ao iniciar na porta {candidate_port} (código {code}). Tentando próxima...")
+            continue
+    print("[bootstrap] Não foi possível iniciar o Streamlit em nenhuma porta entre {port} e 8600.")
+    sys.exit(1)
 
 
 if __name__ == "__main__":
