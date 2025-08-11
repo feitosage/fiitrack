@@ -1,0 +1,35 @@
+# Envs
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Builds/coverage
+build/
+dist/
+.coverage
+coverage.xml
+.cache/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Secrets
+.env
+.env.*
+
+# App data/logs
+fii_quotes.db
+*.db
+streamlit.log
+
