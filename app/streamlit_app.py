@@ -91,7 +91,176 @@ if sel:
     if prices.empty:
         st.info("Sem dados ainda. Clique em **Atualizar dados agora**.")
     else:
-        cot_tab, div_tab, watch_tab, sug_tab = st.tabs(["Cotação", "Dividendos", "Watchlist", "Sugestão"]) 
+        painel_tab, cot_tab, div_tab, watch_tab, sug_tab = st.tabs(["Painel", "Cotação", "Dividendos", "Watchlist", "Sugestão"]) 
+
+        with painel_tab:
+            st.subheader("Visão geral da watchlist")
+            # CSS escopado para reduzir fontes dos cards (st.metric) apenas nesta aba
+            st.markdown(
+                """
+                <style>
+                .painel-scope [data-testid="stMetricValue"] { font-size: 0.95rem !important; }
+                .painel-scope [data-testid="stMetricLabel"] { font-size: 0.78rem !important; }
+                .painel-scope [data-testid="stMetricDelta"] { font-size: 0.78rem !important; }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.markdown('<div class="painel-scope">', unsafe_allow_html=True)
+            try:
+                with engine.connect() as conn:
+                    prices_all = pd.read_sql(text("SELECT * FROM prices ORDER BY ticker, dt"), conn)
+                    divs_all = pd.read_sql(text("SELECT ticker, ex_date, value FROM dividends"), conn)
+                prices_all = prices_all[prices_all["ticker"].isin(tickers)].copy()
+                if prices_all.empty:
+                    st.info("Sem dados suficientes na watchlist.")
+                else:
+
+                    prices_all["dt"] = pd.to_datetime(prices_all["dt"]) 
+                    overview_rows = []
+                    for tk in sorted(prices_all["ticker"].unique()):
+                        g = prices_all[prices_all["ticker"] == tk].sort_values("dt")
+                        if g.empty:
+                            continue
+                        last_close = float(g.iloc[-1]["close"]) if pd.notna(g.iloc[-1]["close"]) else None
+                        last_dt = pd.to_datetime(g["dt"]).max()
+                        # Retornos
+                        if len(g) >= 22 and last_close is not None and pd.notna(g.iloc[-22]["close"]) and g.iloc[-22]["close"]:
+                            ret22 = last_close / float(g.iloc[-22]["close"]) - 1.0
+                        else:
+                            ret22 = None
+                        if len(g) >= 63 and last_close is not None and pd.notna(g.iloc[-63]["close"]) and g.iloc[-63]["close"]:
+                            ret63 = last_close / float(g.iloc[-63]["close"]) - 1.0
+                        else:
+                            ret63 = None
+                        if len(g) >= 252 and last_close is not None and pd.notna(g.iloc[-252]["close"]) and g.iloc[-252]["close"]:
+                            ret252 = last_close / float(g.iloc[-252]["close"]) - 1.0
+                        else:
+                            ret252 = None
+                        # Liquidez
+                        liq21 = float(pd.to_numeric(g["volume"], errors="coerce").tail(21).mean())
+                        # DY 12m
+                        dy12 = None
+                        if not divs_all.empty and last_close and last_close > 0:
+                            dtk = divs_all[divs_all["ticker"] == tk].copy()
+                            if not dtk.empty:
+                                dtk["ex_date"] = pd.to_datetime(dtk["ex_date"]) 
+                                cutoff_div = last_dt - pd.offsets.DateOffset(years=1)
+                                d12 = dtk[dtk["ex_date"] >= cutoff_div]
+                                dy12 = float(d12["value"].sum()) / last_close if not d12.empty else 0.0
+                        overview_rows.append({
+                            "ticker": tk,
+                            "preco": last_close,
+                            "ret_1m": ret22,
+                            "ret_3m": ret63,
+                            "ret_12m": ret252,
+                            "dy12m": dy12,
+                            "liq21d": liq21,
+                        })
+                    ov = pd.DataFrame(overview_rows)
+                    if ov.empty:
+                        st.info("Sem dados suficientes na watchlist.")
+                    else:
+                        csum1, csum2, csum3 = st.columns(3)
+                        with csum1:
+                            st.metric("FIIs na watchlist", f"{ov['ticker'].nunique()}")
+                        with csum2:
+                            try:
+                                last_dt_all = pd.to_datetime(prices_all["dt"]).max().date()
+                                st.metric("Última data disponível", str(last_dt_all))
+                            except Exception:
+                                pass
+                        with csum3:
+                            try:
+                                avg_dy = float(pd.to_numeric(ov["dy12m"], errors="coerce").fillna(0).mean()) * 100
+                                st.metric("DY médio (12m)", f"{avg_dy:,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."))
+                            except Exception:
+                                pass
+
+                        st.markdown("#### Tabela de métricas (watchlist)")
+                        # Exibição com percentuais em colunas dedicadas
+                        ov_disp = ov.copy()
+                        ov_disp["ret_1m_%"] = ov_disp["ret_1m"].apply(lambda v: v*100 if pd.notna(v) else None)
+                        ov_disp["ret_3m_%"] = ov_disp["ret_3m"].apply(lambda v: v*100 if pd.notna(v) else None)
+                        ov_disp["ret_12m_%"] = ov_disp["ret_12m"].apply(lambda v: v*100 if pd.notna(v) else None)
+                        ov_disp["dy12m_%"] = ov_disp["dy12m"].apply(lambda v: v*100 if pd.notna(v) else None)
+                        cols_tbl = ["ticker", "preco", "ret_1m_%", "ret_3m_%", "ret_12m_%", "dy12m_%", "liq21d"]
+                        df_tbl = ov_disp[cols_tbl].rename(columns={
+                            "ticker": "Ticker",
+                            "preco": "Preço",
+                            "ret_1m_%": "Retorno 1M (%)",
+                            "ret_3m_%": "Retorno 3M (%)",
+                            "ret_12m_%": "Retorno 12M (%)",
+                            "dy12m_%": "DY 12M (%)",
+                            "liq21d": "Liq. média 21d",
+                        })
+                        fmt_curr = lambda v: "" if pd.isna(v) else f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                        fmt_pct = lambda v: "" if pd.isna(v) else f"{v:,.2f}%".replace(",", "X").replace(".", ",").replace("X", ".")
+                        fmt_num = lambda v: "" if pd.isna(v) else f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                        st.dataframe(
+                            df_tbl.style.format({
+                                "Preço": fmt_curr,
+                                "Retorno 1M (%)": fmt_pct,
+                                "Retorno 3M (%)": fmt_pct,
+                                "Retorno 12M (%)": fmt_pct,
+                                "DY 12M (%)": fmt_pct,
+                                "Liq. média 21d": fmt_num,
+                            }),
+                            use_container_width=True,
+                        )
+
+                        # Gráfico simples: retorno 1M por ticker
+                        try:
+                            plot_df = ov_disp.dropna(subset=["ret_1m_%"]).sort_values("ret_1m_%", ascending=False)
+                            if not plot_df.empty:
+                                fig_r1m = px.bar(plot_df, x="ret_1m_%", y="ticker", orientation="h", title="Retorno 1M por FII")
+                                fig_r1m.update_layout(xaxis_title="Retorno 1M (%)", yaxis_title="")
+                                fig_r1m.update_traces(text=plot_df["ret_1m_%"].map(lambda v: f"{v:.2f}%"), textposition="outside")
+                                st.plotly_chart(fig_r1m, use_container_width=True)
+                            else:
+                                st.info("Sem dados para o gráfico de Retorno 1M.")
+                        except Exception:
+                            st.info("Não foi possível exibir o gráfico de Retorno 1M.")
+
+                        # Cartões: Top 5 altas e Top 5 baixas do dia — ao final da seção
+                        try:
+                            df_rb = prices_all.copy()
+                            df_rb["dt"] = pd.to_datetime(df_rb["dt"]).dt.date
+                            df_rb = df_rb.sort_values(["ticker", "dt"]).copy()
+                            df_rb["close_prev"] = df_rb.groupby("ticker")["close"].shift(1)
+                            last_dt = df_rb["dt"].max()
+                            today_df = df_rb[(df_rb["dt"] == last_dt) & df_rb["close_prev"].notna()].copy()
+                            if not today_df.empty:
+                                today_df["ret"] = (today_df["close"] / today_df["close_prev"]) - 1
+                                top_gainers = today_df.sort_values("ret", ascending=False).head(5)
+                                top_losers = today_df.sort_values("ret", ascending=True).head(5)
+
+                                st.markdown("#### Altas e baixas do dia")
+                                st.markdown("**Top 5 Altas**")
+                                cols = st.columns(5)
+                                for i, (_, r) in enumerate(top_gainers.iterrows()):
+                                    with cols[i % 5]:
+                                        st.metric(
+                                            str(r["ticker"]),
+                                            f"R$ {float(r['close']):,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                                            f"{float(r['ret'])*100:,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."),
+                                        )
+                                st.markdown("**Top 5 Baixas**")
+                                cols = st.columns(5)
+                                for i, (_, r) in enumerate(top_losers.iterrows()):
+                                    with cols[i % 5]:
+                                        st.metric(
+                                            str(r["ticker"]),
+                                            f"R$ {float(r['close']):,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
+                                            f"{float(r['ret'])*100:,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."),
+                                        )
+                            else:
+                                st.info("Sem dados para calcular altas/baixas do dia.")
+                        except Exception:
+                            st.info("Não foi possível calcular as altas/baixas do dia.")
+            except Exception as e:
+                st.info(f"Não foi possível montar o painel. {e}")
+            st.markdown('</div>', unsafe_allow_html=True)
 
         with cot_tab:
             # Métricas rápidas (cotação)
