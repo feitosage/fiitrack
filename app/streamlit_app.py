@@ -91,7 +91,7 @@ if sel:
     if prices.empty:
         st.info("Sem dados ainda. Clique em **Atualizar dados agora**.")
     else:
-        cot_tab, div_tab, watch_tab = st.tabs(["Cotação", "Dividendos", "Watchlist"])
+        cot_tab, div_tab, watch_tab, sug_tab = st.tabs(["Cotação", "Dividendos", "Watchlist", "Sugestão"]) 
 
         with cot_tab:
             # Métricas rápidas (cotação)
@@ -249,12 +249,23 @@ if sel:
                         last_dt = pd.to_datetime(g["dt"]).max()
                         cutoff_12m = last_dt - pd.offsets.DateOffset(days=365)
                         g12 = g[g["dt"] >= cutoff_12m]
-                        if len(g12) >= 2 and last_close and last_close > 0:
+                        if len(g12) >= 2 and last_close is not None and last_close > 0:
                             ret12 = float(g12.iloc[-1]["close"]) / float(g12.iloc[0]["close"]) - 1.0
                         else:
                             ret12 = None
                         ret_series = g["close"].pct_change().dropna().tail(252)
                         vol_ann = float(ret_series.std() * (252 ** 0.5)) if len(ret_series) >= 20 else None
+                        vol_21d = float(g["close"].pct_change().dropna().tail(21).std() * (252 ** 0.5)) if g["close"].pct_change().dropna().shape[0] >= 10 else None
+                        vol_63d = float(g["close"].pct_change().dropna().tail(63).std() * (252 ** 0.5)) if g["close"].pct_change().dropna().shape[0] >= 20 else None
+                        # Retornos recentes
+                        if len(g) >= 22 and last_close is not None and pd.notna(g.iloc[-22]["close"]) and g.iloc[-22]["close"]:
+                            ret22 = last_close / float(g.iloc[-22]["close"]) - 1.0
+                        else:
+                            ret22 = None
+                        if len(g) >= 63 and last_close is not None and pd.notna(g.iloc[-63]["close"]) and g.iloc[-63]["close"]:
+                            ret63 = last_close / float(g.iloc[-63]["close"]) - 1.0
+                        else:
+                            ret63 = None
                         liq21 = float(pd.to_numeric(g["volume"], errors="coerce").tail(21).mean())
                         dy12 = None
                         dy_cv = None
@@ -270,14 +281,27 @@ if sel:
                                     monthly = dtk12.groupby(dtk12["ex_date"].dt.to_period("M"))["value"].sum()
                                     if monthly.mean() and monthly.mean() != 0:
                                         dy_cv = float(monthly.std() / monthly.mean())
+                        # Máximo drawdown (últimos 252 dias)
+                        closes_252 = g["close"].tail(252)
+                        if len(closes_252) >= 5:
+                            roll_max = closes_252.cummax()
+                            dd = (closes_252 / roll_max) - 1.0
+                            mdd = float(dd.min())
+                        else:
+                            mdd = None
                         rows.append({
                             "ticker": tk,
                             "preco": last_close,
                             "ret12m": ret12,
                             "vol_ann": vol_ann,
+                            "vol21d": vol_21d,
+                            "vol63d": vol_63d,
+                            "ret22d": ret22,
+                            "ret63d": ret63,
                             "liq21d": liq21,
                             "dy12m": dy12,
                             "dy_cv": dy_cv,
+                            "mdd": mdd,
                         })
 
                     mt = pd.DataFrame(rows)
@@ -293,75 +317,247 @@ if sel:
                                 return pd.Series([0.5] * len(s), index=s.index)
                             return (s - vmin) / (vmax - vmin)
 
-                        # Pesos fixos (somam 1)
-                        w_dy, w_ret, w_vol, w_liq, w_stb = 0.35, 0.25, 0.15, 0.15, 0.10
+                        # Normalizações
                         n_dy = norm_minmax(mt["dy12m"]).fillna(0)
-                        n_ret = norm_minmax(mt["ret12m"]).fillna(0)
-                        n_vol = norm_minmax(mt["vol_ann"]).fillna(0); n_vol_inv = 1 - n_vol
+                        n_ret12 = norm_minmax(mt["ret12m"]).fillna(0)
+                        n_ret22 = norm_minmax(mt["ret22d"]).fillna(0)
+                        n_ret63 = norm_minmax(mt["ret63d"]).fillna(0)
+                        n_vol_inv = 1 - norm_minmax(mt["vol_ann"]).fillna(0)
+                        n_vol21_inv = 1 - norm_minmax(mt["vol21d"]).fillna(0)
+                        n_vol63_inv = 1 - norm_minmax(mt["vol63d"]).fillna(0)
                         n_liq = norm_minmax(mt["liq21d"]).fillna(0)
-                        n_stb_raw = norm_minmax(mt["dy_cv"]).fillna(0); n_stb = 1 - n_stb_raw
+                        n_stb = 1 - norm_minmax(mt["dy_cv"]).fillna(0)
+                        # Drawdown: magnitude (positivo) e invertido (menor melhor)
+                        dd_mag = mt["mdd"].apply(lambda v: -float(v) if pd.notna(v) and v < 0 else 0.0)
+                        n_ddinv = 1 - norm_minmax(dd_mag).fillna(0)
 
-                        mt["score"] = (
-                            w_dy * n_dy +
-                            w_ret * n_ret +
-                            w_vol * n_vol_inv +
-                            w_liq * n_liq +
-                            w_stb * n_stb
+                        # Scores por horizonte
+                        mt["score_curto"] = (
+                            0.45 * n_ret22 + 0.25 * n_vol21_inv + 0.25 * n_liq + 0.05 * n_dy
                         )
-                        top5 = mt.sort_values("score", ascending=False).head(5).reset_index(drop=True)
+                        mt["score_medio"] = (
+                            0.25 * n_ret63 + 0.15 * n_ret12 + 0.20 * n_vol63_inv + 0.20 * n_dy + 0.15 * n_stb + 0.05 * n_liq
+                        )
+                        mt["score_longo"] = (
+                            0.35 * n_dy + 0.25 * n_stb + 0.15 * n_vol_inv + 0.15 * n_ddinv + 0.10 * n_ret12
+                        )
 
-                        norms = pd.DataFrame({
-                            "ticker": mt["ticker"],
-                            "n_dy": n_dy,
-                            "n_ret": n_ret,
-                            "n_vol_inv": n_vol_inv,
-                            "n_liq": n_liq,
-                            "n_stb": n_stb,
-                        }).set_index("ticker")
+                        # Selecionar 5 FIIs distintos
+                        remaining = mt.copy()
+                        winners = []
+                        # Curto
+                        if not remaining["score_curto"].dropna().empty:
+                            i1 = remaining["score_curto"].idxmax()
+                            winners.append(("Curto prazo", remaining.loc[i1]))
+                            remaining = remaining[remaining["ticker"] != remaining.loc[i1, "ticker"]]
+                        # Médio
+                        if not remaining.empty and not remaining["score_medio"].dropna().empty:
+                            i2 = remaining["score_medio"].idxmax()
+                            winners.append(("Médio prazo", remaining.loc[i2]))
+                            remaining = remaining[remaining["ticker"] != remaining.loc[i2, "ticker"]]
+                        # Longo
+                        if not remaining.empty and not remaining["score_longo"].dropna().empty:
+                            i3 = remaining["score_longo"].idxmax()
+                            winners.append(("Longo prazo", remaining.loc[i3]))
+                            remaining = remaining[remaining["ticker"] != remaining.loc[i3, "ticker"]]
 
-                        for _, row in top5.iterrows():
+                        # Extras (2) pelo melhor score entre curto/médio/longo — com rotulagem por horizonte
+                        if not remaining.empty:
+                            best_combo = remaining[["score_curto", "score_medio", "score_longo"]].max(axis=1)
+                            best_idx = best_combo.dropna().sort_values(ascending=False).head(2).index.tolist()
+                            for bx in best_idx:
+                                r = remaining.loc[bx]
+                                sc_c = float(r.get("score_curto", 0) or 0)
+                                sc_m = float(r.get("score_medio", 0) or 0)
+                                sc_l = float(r.get("score_longo", 0) or 0)
+                                if sc_c >= sc_m and sc_c >= sc_l:
+                                    label = "Curto prazo"
+                                elif sc_m >= sc_c and sc_m >= sc_l:
+                                    label = "Médio prazo"
+                                else:
+                                    label = "Longo prazo"
+                                winners.append((label, r))
+                            remaining = remaining.drop(index=best_idx, errors="ignore")
+
+                        # Apresentação
+                        for horizon, row in winners:
                             tk = row["ticker"]
-                            score_pct = (row["score"] if pd.notna(row["score"]) else 0) * 100
-                            contrib = {}
-                            if tk in norms.index:
-                                rn = norms.loc[tk]
+                            if horizon == "Curto prazo":
+                                score_pct = float(row["score_curto"]) * 100 if pd.notna(row["score_curto"]) else 0
                                 contrib = {
-                                    "Dividend Yield": w_dy * float(rn["n_dy"]),
-                                    "Retorno 12 meses": w_ret * float(rn["n_ret"]),
-                                    "Baixa volatilidade": w_vol * float(rn["n_vol_inv"]),
-                                    "Liquidez": w_liq * float(rn["n_liq"]),
-                                    "Estabilidade do DY": w_stb * float(rn["n_stb"]),
+                                    "Retorno 22 dias": 0.45 * float(n_ret22[mt["ticker"] == tk].iloc[0]) if not n_ret22.empty else 0,
+                                    "Baixa volatilidade (21d)": 0.25 * float(n_vol21_inv[mt["ticker"] == tk].iloc[0]) if not n_vol21_inv.empty else 0,
+                                    "Liquidez": 0.25 * float(n_liq[mt["ticker"] == tk].iloc[0]) if not n_liq.empty else 0,
+                                    "Dividend Yield": 0.05 * float(n_dy[mt["ticker"] == tk].iloc[0]) if not n_dy.empty else 0,
                                 }
+                            elif horizon == "Médio prazo":
+                                score_pct = float(row["score_medio"]) * 100 if pd.notna(row["score_medio"]) else 0
+                                contrib = {
+                                    "Retorno 63 dias": 0.25 * float(n_ret63[mt["ticker"] == tk].iloc[0]) if not n_ret63.empty else 0,
+                                    "Retorno 12 meses": 0.15 * float(n_ret12[mt["ticker"] == tk].iloc[0]) if not n_ret12.empty else 0,
+                                    "Baixa volatilidade (63d)": 0.20 * float(n_vol63_inv[mt["ticker"] == tk].iloc[0]) if not n_vol63_inv.empty else 0,
+                                    "Dividend Yield": 0.20 * float(n_dy[mt["ticker"] == tk].iloc[0]) if not n_dy.empty else 0,
+                                    "Estabilidade do DY": 0.15 * float(n_stb[mt["ticker"] == tk].iloc[0]) if not n_stb.empty else 0,
+                                    "Liquidez": 0.05 * float(n_liq[mt["ticker"] == tk].iloc[0]) if not n_liq.empty else 0,
+                                }
+                            elif horizon == "Longo prazo":
+                                score_pct = float(row["score_longo"]) * 100 if pd.notna(row["score_longo"]) else 0
+                                contrib = {
+                                    "Dividend Yield": 0.35 * float(n_dy[mt["ticker"] == tk].iloc[0]) if not n_dy.empty else 0,
+                                    "Estabilidade do DY": 0.25 * float(n_stb[mt["ticker"] == tk].iloc[0]) if not n_stb.empty else 0,
+                                    "Baixa volatilidade (252d)": 0.15 * float(n_vol_inv[mt["ticker"] == tk].iloc[0]) if not n_vol_inv.empty else 0,
+                                    "Menor drawdown": 0.15 * float(n_ddinv[mt["ticker"] == tk].iloc[0]) if not n_ddinv.empty else 0,
+                                    "Retorno 12 meses": 0.10 * float(n_ret12[mt["ticker"] == tk].iloc[0]) if not n_ret12.empty else 0,
+                                }
+                            else:
+                                # Não deve ocorrer; winners só contém rótulos "Curto prazo", "Médio prazo" ou "Longo prazo"
+                                score_pct = 0
+                                contrib = {}
+
                             total_c = sum(contrib.values()) if contrib else 0.0
-                            top_factors = []
+                            factors = []
                             if total_c > 0:
-                                top_factors = [
+                                factors = [
                                     (name, (val/total_c)*100.0)
                                     for name, val in sorted(contrib.items(), key=lambda kv: kv[1], reverse=True)[:3]
                                 ]
 
-                            st.markdown(f"### {tk} — Pontuação {score_pct:.1f}%")
+                            st.markdown(f"### {horizon}: {tk} — Pontuação {score_pct:.1f}%")
                             c1, c2, c3 = st.columns(3)
                             with c1:
                                 st.metric("Preço atual", f"R$ {row['preco']:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
                                 st.metric("Dividend Yield (12m)", f"{((row['dy12m'] or 0)*100 if row['dy12m'] is not None else 0):,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."))
                             with c2:
-                                st.metric("Retorno 12m", f"{((row['ret12m'] or 0)*100 if row['ret12m'] is not None else 0):,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."))
-                                volp = (row["vol_ann"] or 0) * 100 if row["vol_ann"] is not None else 0
+                                ret12p = (row['ret12m'] or 0) * 100 if row['ret12m'] is not None else 0
+                                st.metric("Retorno 12m", f"{ret12p:,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."))
+                                volp = (row['vol_ann'] or 0) * 100 if row['vol_ann'] is not None else 0
                                 st.metric("Volatilidade anualizada", f"{volp:,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."))
                             with c3:
                                 st.metric("Liquidez média (21d)", f"{row['liq21d']:,.0f}".replace(",", "."))
-                                cvv = row["dy_cv"] if row["dy_cv"] is not None else 0
+                                cvv = row['dy_cv'] if row['dy_cv'] is not None else 0
                                 st.metric("Estabilidade do DY (CV)", f"{cvv:.2f}")
 
-                            if top_factors:
-                                bullets = "\n".join([f"- {name}: {share:.1f}% da pontuação" for name, share in top_factors])
-                                st.markdown("Por que está entre os melhores:\n" + bullets)
+                            if factors:
+                                bullets = "\n".join([f"- {name}: {share:.1f}% da pontuação" for name, share in factors])
+                                st.markdown("Por que sugerimos este FII:\n" + bullets)
                             else:
-                                st.markdown("Por que está entre os melhores:\n- Dados insuficientes para decompor a pontuação")
+                                st.markdown("Por que sugerimos este FII:\n- Dados insuficientes para detalhar a pontuação")
                             st.divider()
             except Exception as e:
                 st.info(f"Não foi possível montar a seção Watchlist. {e}")
+
+        # Aba Sugestão — somente sugestões trimestrais
+        with sug_tab:
+
+            # Sugestões — Top 5 custo-benefício (trimestre)
+            st.subheader("Sugestões — Top 5 custo-benefício (trimestre)")
+            try:
+                with engine.connect() as conn:
+                    prices_all = pd.read_sql(text("SELECT * FROM prices ORDER BY ticker, dt"), conn)
+                    divs_all = pd.read_sql(text("SELECT * FROM dividends"), conn)
+                prices_all = prices_all[prices_all["ticker"].isin(tickers)].copy()
+                if prices_all.empty:
+                    st.info("Sem dados suficientes na watchlist.")
+                else:
+                    prices_all["dt"] = pd.to_datetime(prices_all["dt"]) 
+                    rows = []
+                    for tk in sorted(prices_all["ticker"].unique()):
+                        g = prices_all[prices_all["ticker"] == tk].sort_values("dt")
+                        if g.empty:
+                            continue
+                        last_close = float(g.iloc[-1]["close"]) if pd.notna(g.iloc[-1]["close"]) else None
+                        last_dt = pd.to_datetime(g["dt"]).max()
+                        # Retorno 63 dias (aprox. 3 meses) e vol 63d
+                        if len(g) >= 63 and last_close is not None and pd.notna(g.iloc[-63]["close"]) and g.iloc[-63]["close"]:
+                            ret63 = last_close / float(g.iloc[-63]["close"]) - 1.0
+                        else:
+                            ret63 = None
+                        ret_series = g["close"].pct_change().dropna().tail(63)
+                        vol63 = float(ret_series.std()) if len(ret_series) >= 10 else None
+                        # DY 3m
+                        dy3m = None
+                        if not divs_all.empty and last_close and last_close > 0:
+                            dtk = divs_all[divs_all["ticker"] == tk].copy()
+                            if not dtk.empty:
+                                dtk["ex_date"] = pd.to_datetime(dtk["ex_date"]) 
+                                cutoff_3m = last_dt - pd.offsets.DateOffset(months=3)
+                                d3 = dtk[dtk["ex_date"] >= cutoff_3m]
+                                dy3m = float(d3["value"].sum()) / last_close if not d3.empty else 0.0
+                        liq21 = float(pd.to_numeric(g["volume"], errors="coerce").tail(21).mean())
+                        rows.append({
+                            "ticker": tk,
+                            "preco": last_close,
+                            "ret63": ret63,
+                            "vol63": vol63,
+                            "dy3m": dy3m,
+                            "liq21d": liq21,
+                        })
+                    mtq = pd.DataFrame(rows)
+                    if mtq.empty:
+                        st.info("Sem dados suficientes na watchlist.")
+                    else:
+                        def norm_minmax_q(s: pd.Series) -> pd.Series:
+                            s = pd.to_numeric(s, errors="coerce")
+                            if s.dropna().empty:
+                                return pd.Series([0.0] * len(s), index=s.index)
+                            vmin, vmax = s.min(), s.max()
+                            if pd.isna(vmin) or pd.isna(vmax) or vmax - vmin == 0:
+                                return pd.Series([0.5] * len(s), index=s.index)
+                            return (s - vmin) / (vmax - vmin)
+                        # Ratio retorno/vol 63d
+                        ratio = []
+                        for _, r in mtq.iterrows():
+                            rr = r.get("ret63")
+                            vv = r.get("vol63")
+                            ratio.append((rr / (vv if (vv is not None and vv != 0) else 1e-9)) if rr is not None and vv is not None else None)
+                        mtq["ratio"] = ratio
+                        n_ratio = norm_minmax_q(mtq["ratio"]).fillna(0)
+                        n_ret63 = norm_minmax_q(mtq["ret63"]).fillna(0)
+                        n_vol63_inv = 1 - norm_minmax_q(mtq["vol63"]).fillna(0)
+                        n_dy3m = norm_minmax_q(mtq["dy3m"]).fillna(0)
+                        n_liq = norm_minmax_q(mtq["liq21d"]).fillna(0)
+                        # Pesos custo-benefício (trimestre)
+                        w_ratio, w_ret, w_vol, w_dy, w_liq = 0.45, 0.25, 0.15, 0.10, 0.05
+                        mtq["score_q"] = (
+                            w_ratio*n_ratio + w_ret*n_ret63 + w_vol*n_vol63_inv + w_dy*n_dy3m + w_liq*n_liq
+                        )
+                        top5q = mtq.sort_values("score_q", ascending=False).head(5).reset_index(drop=True)
+                        for _, r in top5q.iterrows():
+                            tk = r["ticker"]
+                            score_pct = (r["score_q"] if pd.notna(r["score_q"]) else 0) * 100
+                            contrib = {
+                                "Retorno/Vol 63d": w_ratio * float(n_ratio[mtq["ticker"] == tk].iloc[0]) if not n_ratio.empty else 0,
+                                "Retorno 63d": w_ret * float(n_ret63[mtq["ticker"] == tk].iloc[0]) if not n_ret63.empty else 0,
+                                "Baixa volatilidade 63d": w_vol * float(n_vol63_inv[mtq["ticker"] == tk].iloc[0]) if not n_vol63_inv.empty else 0,
+                                "Dividendos 3m": w_dy * float(n_dy3m[mtq["ticker"] == tk].iloc[0]) if not n_dy3m.empty else 0,
+                                "Liquidez": w_liq * float(n_liq[mtq["ticker"] == tk].iloc[0]) if not n_liq.empty else 0,
+                            }
+                            total_c = sum(contrib.values()) if contrib else 0.0
+                            factors = []
+                            if total_c > 0:
+                                factors = [
+                                    (name, (val/total_c)*100.0)
+                                    for name, val in sorted(contrib.items(), key=lambda kv: kv[1], reverse=True)[:3]
+                                ]
+                            st.markdown(f"### {tk} — Pontuação {score_pct:.1f}% (custo-benefício trimestral)")
+                            c1, c2, c3 = st.columns(3)
+                            with c1:
+                                st.metric("Preço atual", f"R$ {r['preco']:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+                                ret63p = (r['ret63'] or 0) * 100 if r['ret63'] is not None else 0
+                                st.metric("Retorno 63d", f"{ret63p:,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."))
+                            with c2:
+                                vol63p = (r['vol63'] or 0) * 100 if r['vol63'] is not None else 0
+                                st.metric("Volatilidade 63d (dp)", f"{vol63p:,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."))
+                                dy3mp = (r['dy3m'] or 0) * 100 if r['dy3m'] is not None else 0
+                                st.metric("Dividendos 3m / preço", f"{dy3mp:,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."))
+                            with c3:
+                                st.metric("Liquidez média (21d)", f"{r['liq21d']:,.0f}".replace(",", "."))
+                            if factors:
+                                bullets = "\n".join([f"- {name}: {share:.1f}% da pontuação" for name, share in factors])
+                                st.markdown("Por que está entre as melhores (trimestre):\n" + bullets)
+                            st.divider()
+            except Exception:
+                st.info("Não foi possível montar as sugestões trimestrais.")
 
 
 st.caption("Dados via Yahoo Finance (yfinance). DY e métricas são estimativas e não substituem análises oficiais.")
